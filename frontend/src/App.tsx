@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
-import { AskPanel } from "./components/AskPanel";
+import { Chat } from "./components/Chat";
 import { DocumentsPanel } from "./components/DocumentsPanel";
-import { HealthBadge } from "./components/HealthBadge";
 import type { DocumentOut } from "./types";
 
 export function App() {
@@ -34,23 +33,40 @@ export function App() {
       return next;
     });
 
+  const selectedDocs = documents.filter((d) => selected.has(d.id));
+  const scopeChips =
+    selectedDocs.length === 0
+      ? [documents.length === 0 ? "No documents" : `All documents (${documents.length})`]
+      : selectedDocs.length <= 2
+        ? selectedDocs.map((d) => d.filename)
+        : [selectedDocs[0].filename, `+${selectedDocs.length - 1} more`];
+
   return (
     <div className="app">
-      <header className="topbar">
-        <h1>DocuAsk</h1>
-        <p className="tagline">Answers grounded only in your documents, with verified citations.</p>
-        <HealthBadge />
-      </header>
-      <main className="layout">
-        <DocumentsPanel
-          documents={documents}
-          loadError={loadError}
-          selected={selected}
-          onToggle={toggle}
-          onClearSelection={() => setSelected(new Set())}
-          onChanged={refresh}
-        />
-        <AskPanel documents={documents} selectedIds={[...selected]} />
+      <DocumentsPanel
+        documents={documents}
+        loadError={loadError}
+        selected={selected}
+        onToggle={toggle}
+        onChanged={refresh}
+      />
+      <main className="main">
+        <header className="page-head">
+          <div>
+            <h1>Ask your documents</h1>
+            <p className="subtitle">
+              Answers come only from {selected.size === 0 ? "your documents" : "the selected documents"}, with sources.
+            </p>
+          </div>
+          <div className="scope">
+            {scopeChips.map((c) => (
+              <span key={c} className="chip chip-outline" title={c}>
+                {c}
+              </span>
+            ))}
+          </div>
+        </header>
+        <Chat documentCount={documents.length} selectedIds={[...selected]} />
       </main>
     </div>
   );

@@ -20,7 +20,6 @@ export function HealthBadge() {
         const h = await api.health();
         if (!cancelled) setState(h.status === "ok" ? "ok" : "degraded");
       } catch {
-        // /health answers 503 with a body when degraded; anything thrown here is "can't tell / down".
         if (!cancelled) setState("down");
       }
     };
