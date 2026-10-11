@@ -1,0 +1,26 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# runtime data (uploaded documents, Chroma persistence)
+data/
+
+# eval output (reports are committed deliberately, raw runs are not)
+eval/runs/
+
+# node (frontend, stage 8)
+node_modules/
+frontend/dist/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

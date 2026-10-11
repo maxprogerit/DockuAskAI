@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Tuple
+
+from sqlalchemy.exc import IntegrityError
+
+from app.core.config import Settings
+from app.core.errors import DocumentNotFoundError, NoExtractableTextError
+from app.models.document import Document, DocumentStatus
+from app.repositories.documents import DocumentRepository
+from app.services.embeddings import Embedder
+from app.services.file_validation import check_size, detect_file_type, sanitize_filename
+from app.services.ingestion import build_chunks, embed_and_store
+from app.services.vector_store import VectorStore
+
+logger = logging.getLogger(__name__)
+
+MEDIA_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+# A row stuck in PROCESSING for longer than this is a crashed upload, not a running one.
+STALE_PROCESSING_SECONDS = 10 * 60
+
+
+class DocumentService:
+    def __init__(self, repo: DocumentRepository, settings: Settings, embedder: Embedder, store: VectorStore) -> None:
+        self._repo = repo
+        self._settings = settings
+        self._embedder = embedder
+        self._store = store
+        self._upload_dir = Path(settings.upload_dir)
+
+    # ------------------------------------------------------------------ upload
+
+    def upload(self, raw_filename: str, data: bytes) -> Tuple[Document, bool]:
+        """Returns (document, created). created=False means an identical file already existed."""
+        started = time.perf_counter()
+        check_size(len(data), self._settings.max_upload_bytes)
+        filename = sanitize_filename(raw_filename)
+        file_type = detect_file_type(data, filename)
+        digest = hashlib.sha256(data).hexdigest()
+
+        existing = self._repo.get_by_hash(digest)
+        if existing is not None:
+            if existing.status == DocumentStatus.READY or not self._is_stale(existing):
+                return existing, False  # duplicate: no parsing, no embeddings call
+            logger.warning("purging stale document before re-ingest", extra={"document_id": str(existing.id)})
+            self._purge(existing)
+
+        document_id = uuid.uuid4()
+        # CPU-only and may raise 422 (corrupt / scan / too many pages) BEFORE any side effect.
+        parsed, chunks = build_chunks(
+            str(document_id), filename, data, file_type,
+            self._settings.max_pages, self._settings.chunk_size, self._settings.chunk_overlap,
+        )
+        if not chunks:
+            raise NoExtractableTextError("No extractable text found in the document.")
+
+        document = Document(
+            id=document_id,
+            filename=filename,
+            file_hash=digest,
+            file_path="%s.%s" % (document_id, file_type.value),
+            page_count=parsed.page_count,
+            chunk_count=0,
+            status=DocumentStatus.PROCESSING,
+        )
+        try:
+            self._repo.add(document)
+        except IntegrityError:
+            # Two identical uploads raced; the other one won. Return its record.
+            self._repo.rollback()
+            winner = self._repo.get_by_hash(digest)
+            if winner is None:
+                raise
+            return winner, False
+
+        try:
+            self._write_file(document.file_path, data)
+            embedding_tokens = embed_and_store(chunks, self._embedder, self._store)
+            document.chunk_count = len(chunks)
+            document.status = DocumentStatus.READY
+            self._repo.commit()
+        except BaseException:
+            # Leave nothing half-ingested: no vectors, no file, no row (so a retry starts clean).
+            self._repo.rollback()
+            self._purge(document)
+            raise
+
+        logger.info(
+            "document ingested",
+            extra={
+                "document_id": str(document.id),
+                "file_type": file_type.value,
+                "pages": parsed.page_count,
+                "chunks": len(chunks),
+                "embedding_tokens": embedding_tokens,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+            },
+        )
+        return document, True
+
+    # ------------------------------------------------------------------ read
+
+    def list_documents(self) -> List[Document]:
+        return self._repo.list_all()
+
+    def get(self, document_id: uuid.UUID) -> Document:
+        document = self._repo.get(document_id)
+        if document is None:
+            raise DocumentNotFoundError("Document not found.")
+        return document
+
+    def file_for(self, document: Document) -> Path:
+        """Absolute path of the stored original, guaranteed to be inside UPLOAD_DIR."""
+        base = self._upload_dir.resolve()
+        path = (base / document.file_path).resolve()
+        # file_path is generated by us (<uuid>.<ext>), but never trust a path read back from a DB.
+        if base not in path.parents or not path.is_file():
+            raise DocumentNotFoundError("The original file is not available.")
+        return path
+
+    # ------------------------------------------------------------------ delete
+
+    def delete(self, document_id: uuid.UUID) -> None:
+        document = self.get(document_id)
+        self._purge(document)
+
+    # ------------------------------------------------------------------ internals
+
+    def _purge(self, document: Document) -> None:
+        """Remove vectors, stored file and DB row. Vectors first: if that fails the row still exists,
+        so the caller can retry the delete instead of leaving orphaned vectors nobody can reach."""
+        self._store.delete_document(str(document.id))
+        try:
+            (self._upload_dir / document.file_path).unlink()
+        except FileNotFoundError:
+            pass
+        self._repo.delete(document)
+
+    def _is_stale(self, document: Document) -> bool:
+        if document.status == DocumentStatus.FAILED:
+            return True
+        created = document.created_at
+        if created.tzinfo is None:  # SQLite returns naive datetimes
+            created = created.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds() > STALE_PROCESSING_SECONDS
+
+    def _write_file(self, relative_path: str, data: bytes) -> None:
+        self._upload_dir.mkdir(parents=True, exist_ok=True)
+        target = self._upload_dir / relative_path
+        temp = target.with_suffix(target.suffix + ".part")
+        temp.write_bytes(data)
+        os.replace(temp, target)  # atomic: readers never see a half-written file

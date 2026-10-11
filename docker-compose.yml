@@ -1,0 +1,57 @@
+# `docker compose up --build` starts PostgreSQL and the API (migrations run automatically).
+# Configuration comes from .env (copy .env.example). Secrets are never baked into the image.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-docuask}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docuask}
+      POSTGRES_DB: ${POSTGRES_DB:-docuask}
+    ports:
+      # Published on the host loopback only, for local tools (psql) or running the API outside docker.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Inside the compose network the database host is the service name, not localhost.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-docuask}:${POSTGRES_PASSWORD:-docuask}@postgres:5432/${POSTGRES_DB:-docuask}
+      UPLOAD_DIR: /data/uploads
+      CHROMA_DIR: /data/chroma
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    volumes:
+      - uploads:/data/uploads
+      - chroma:/data/chroma
+
+  web:
+    # React UI served by nginx, which also proxies /api/* to the API and adds the X-API-Key header,
+    # so the key never reaches the browser. Anyone who can open this port can use the whole API:
+    # it is bound to loopback by default; widen WEB_BIND only behind real authentication.
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_KEY: ${API_KEY:?API_KEY must be set in .env}
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_HOST_PORT:-8080}:80"
+
+volumes:
+  pgdata:
+  uploads:
+  chroma:
